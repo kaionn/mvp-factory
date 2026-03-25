@@ -516,7 +516,7 @@ mvp-factory リポジトリの Settings > Secrets に以下を設定:
 
 | Secret | 用途 | 取得方法 |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | Claude Code 実行 | https://console.anthropic.com/ |
+| `CLAUDE_CODE_OAUTH_TOKEN` | Claude Code 実行（Max plan OAuth） | `claude /oauth-token` で取得 |
 | `PAT_TOKEN` | リポジトリ作成、pain-collector への報告 | GitHub Settings > Developer settings > Personal access tokens（スコープ: repo, workflow） |
 | `VERCEL_TOKEN` | LP デプロイ（オプション） | https://vercel.com/account/tokens |
 
