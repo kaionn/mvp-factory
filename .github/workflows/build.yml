@@ -146,7 +146,7 @@ jobs:
           PROMPT=$(cat ${{ github.workspace }}/templates/claude-prompt.md | sed "s|{{SPEC_PATH}}|$SPEC_PATH|g")
 
           claude -p "$PROMPT" \
-            --allowedTools '*' \
+            --dangerously-skip-permissions \
             --output-format text \
             --max-turns 100 \
             > ../build.log 2>&1 || true
