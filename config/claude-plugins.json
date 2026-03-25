@@ -1,0 +1,9 @@
+{
+  "plugins": [
+    {
+      "name": "compound-engineering",
+      "source": "EveryInc/compound-engineering-plugin",
+      "required": true
+    }
+  ]
+}

@@ -1,0 +1,13 @@
+{
+  "default": "vercel",
+  "targets": {
+    "vercel": {
+      "command": "npx vercel --prod --yes",
+      "requires": ["VERCEL_TOKEN"]
+    },
+    "github-pages": {
+      "command": "gh-pages -d out",
+      "requires": []
+    }
+  }
+}
