@@ -61,6 +61,21 @@ jobs:
             echo "created=true" >> $GITHUB_OUTPUT
           fi
 
+      - name: Wait for template generation
+        run: |
+          # テンプレートからのリポジトリ生成は非同期のため、コンテンツが反映されるまで待機
+          for i in $(seq 1 12); do
+            FILE_COUNT=$(gh api "repos/$PRODUCT_REPO/contents/" --jq 'length' 2>/dev/null || echo "0")
+            if [ "$FILE_COUNT" -gt 0 ]; then
+              echo "✅ Template content ready ($FILE_COUNT files)"
+              break
+            fi
+            echo "Waiting for template generation... (attempt $i/12)"
+            sleep 5
+          done
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
+
       - name: Clone product repository
         env:
           GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
