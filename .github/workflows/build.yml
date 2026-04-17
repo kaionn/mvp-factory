@@ -110,6 +110,33 @@ jobs:
           git commit -m "docs: Spec と Deep Dive を配置"
           git push
 
+      - name: Configure main branch protection
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          # main への直接 push を禁止し PR を必須化。
+          # 個人開発用に reviewer 0 で self-approve を許可。
+          # enforce_admins=false で緊急時は owner が bypass 可能。
+          # build-with-claude は feat/initial-mvp ブランチへ push するため main 保護の影響なし。
+          gh api -X PUT "repos/$PRODUCT_REPO/branches/main/protection" \
+            --input - <<'JSON'
+          {
+            "required_status_checks": null,
+            "enforce_admins": false,
+            "required_pull_request_reviews": {
+              "dismiss_stale_reviews": false,
+              "require_code_owner_reviews": false,
+              "required_approving_review_count": 0
+            },
+            "restrictions": null,
+            "allow_force_pushes": false,
+            "allow_deletions": false,
+            "required_linear_history": false,
+            "required_conversation_resolution": false
+          }
+          JSON
+          echo "✅ main ブランチプロテクションを設定しました: $PRODUCT_REPO"
+
       - name: Upload product-repo as artifact
         uses: actions/upload-artifact@v4
         with:
