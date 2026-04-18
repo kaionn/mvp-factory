@@ -227,8 +227,10 @@ jobs:
           GH_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
           set -euo pipefail
-          # main への直接 push を禁止し PR を必須化。reviewer 0 で self-approve 可、
+          # main への直接 push を禁止し PR を必須化。
+          # 個人開発用に reviewer 0 で self-approve を許可。
           # enforce_admins=false で緊急時は owner が bypass 可能。
+          # build-with-claude は feat/initial-mvp ブランチへ push するため main 保護の影響なし。
           gh api -X PUT "repos/$PRODUCT_REPO/branches/main/protection" \
             --input - <<'JSON'
           {
@@ -246,7 +248,7 @@ jobs:
             "required_conversation_resolution": false
           }
           JSON
-          echo "✅ main ブランチプロテクション設定完了: $PRODUCT_REPO"
+          echo "✅ main ブランチプロテクションを設定しました: $PRODUCT_REPO"
 
       - name: Upload product-repo as artifact
         uses: actions/upload-artifact@v4
