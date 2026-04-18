@@ -37,5 +37,5 @@ jobs:
       - name: Run actionlint
         run: |
           set -euo pipefail
-          # shellcheck も併走させる（actionlint 内蔵）
+          # actionlint runs bundled shellcheck on workflow run blocks
           ./actionlint -color
