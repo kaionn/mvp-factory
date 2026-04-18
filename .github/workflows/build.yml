@@ -34,89 +34,45 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       repo_created: ${{ steps.create.outputs.created }}
+      deployment_target: ${{ steps.parse-target.outputs.deployment_target }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Validate caller
         run: |
+          set -euo pipefail
           SOURCE="${{ github.event.inputs.source_repo }}"
           if [[ "$SOURCE" != kaionn/* ]]; then
             echo "::error::Unauthorized source repo: $SOURCE"
             exit 1
           fi
 
+      - name: Decode spec for downstream steps
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/build
+          echo "${{ github.event.inputs.spec_content }}" | base64 -d > /tmp/build/spec.md
+          echo "Decoded spec to /tmp/build/spec.md"
+
       - name: Validate spec against schema
         id: validate-spec
         env:
           GH_TOKEN: ${{ secrets.PAT_TOKEN }}
-        run: |
-          set -euo pipefail
-
-          SOURCE="${{ github.event.inputs.source_repo }}"
-          SPEC_B64="${{ github.event.inputs.spec_content }}"
-
-          echo "$SPEC_B64" | base64 -d > /tmp/spec.md
-
-          # pain-collector から JSON Schema を取得（main branch から）
-          SCHEMA_URL="https://raw.githubusercontent.com/${SOURCE}/main/specs/schema.json"
-          if ! curl -fsSL "$SCHEMA_URL" -o /tmp/schema.json; then
-            echo "::warning::Schema を取得できませんでした ($SCHEMA_URL)。検証をスキップして続行します。"
-            exit 0
-          fi
-
-          pip install --quiet pyyaml jsonschema
-
-          python3 <<'PY'
-          import json
-          import re
-          import sys
-
-          import yaml
-          from jsonschema import Draft7Validator
-
-          with open('/tmp/spec.md', encoding='utf-8') as f:
-              content = f.read()
-
-          fm_match = re.match(r'^---\s*\n(.*?)\n---\s*\n', content, re.DOTALL)
-          if not fm_match:
-              print('::warning::Front Matter が存在しない legacy Spec です。検証をスキップします。')
-              sys.exit(0)
-
-          try:
-              front_matter = yaml.safe_load(fm_match.group(1))
-          except yaml.YAMLError as exc:
-              print(f'::error::Front Matter の YAML パースに失敗: {exc}')
-              sys.exit(1)
-
-          if not isinstance(front_matter, dict):
-              print('::error::Front Matter がオブジェクト形式ではありません')
-              sys.exit(1)
-
-          with open('/tmp/schema.json', encoding='utf-8') as f:
-              schema = json.load(f)
-
-          validator = Draft7Validator(schema)
-          errors = sorted(validator.iter_errors(front_matter), key=lambda e: list(e.absolute_path))
-
-          if errors:
-              for err in errors:
-                  path = '.'.join(str(p) for p in err.absolute_path) or '<root>'
-                  print(f'::error::Spec validation failure at {path}: {err.message}')
-              sys.exit(1)
-
-          print('✅ Spec validation passed')
-          PY
+          SPEC_PATH: /tmp/build/spec.md
+          SOURCE_REPO: ${{ github.event.inputs.source_repo }}
+        run: ./scripts/validate_spec.sh
 
       - name: Notify spec validation failure
         if: failure() && steps.validate-spec.conclusion == 'failure'
         env:
           GH_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
+          set -euo pipefail
           ISSUE="${{ github.event.inputs.issue_number }}"
           SOURCE="${{ github.event.inputs.source_repo }}"
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
-          gh issue edit "$ISSUE" --repo "$SOURCE" --add-label "spec-invalid" 2>/dev/null || true
+          gh issue edit "$ISSUE" --repo "$SOURCE" --add-label "spec-invalid"
           gh issue comment "$ISSUE" --repo "$SOURCE" --body "❌ Spec が schema 検証に失敗したため build を中止したのだ。
 
           - Schema 仕様: https://github.com/$SOURCE/blob/main/specs/SCHEMA.md
@@ -124,54 +80,124 @@ jobs:
 
           \`/spec --force\` で Spec を再生成してから \`/approve\` を再実行してほしいのだ。"
 
+      - name: Parse deployment target from spec
+        id: parse-target
+        env:
+          SPEC_PATH: /tmp/build/spec.md
+        run: |
+          set -euo pipefail
+          pip install --quiet pyyaml >/dev/null
+
+          DEPLOYMENT_TARGET=$(SPEC_PATH="$SPEC_PATH" python3 <<'PY'
+          import os
+          import re
+          import sys
+          import yaml
+
+          with open(os.environ['SPEC_PATH'], encoding='utf-8') as f:
+              content = f.read()
+
+          fm_match = re.match(r'^---\s*\n(.*?)\n---\s*\n', content, re.DOTALL)
+          if not fm_match:
+              # legacy spec → deploy-targets.json の default を使う
+              print('')
+              sys.exit(0)
+
+          fm = yaml.safe_load(fm_match.group(1)) or {}
+          target = fm.get('deployment_target', '') if isinstance(fm, dict) else ''
+          print(target)
+          PY
+          )
+
+          # config/deploy-targets.json から default を読む（空の場合）
+          if [ -z "$DEPLOYMENT_TARGET" ]; then
+            DEPLOYMENT_TARGET=$(jq -r '.default' config/deploy-targets.json)
+          fi
+
+          # config に存在するキーかバリデート
+          if ! jq -e --arg t "$DEPLOYMENT_TARGET" '.targets[$t]' config/deploy-targets.json >/dev/null; then
+            echo "::warning::deployment_target '$DEPLOYMENT_TARGET' が config/deploy-targets.json に未定義のためデフォルトを使用"
+            DEPLOYMENT_TARGET=$(jq -r '.default' config/deploy-targets.json)
+          fi
+
+          echo "deployment_target=$DEPLOYMENT_TARGET" >> "$GITHUB_OUTPUT"
+          echo "✅ deployment_target: $DEPLOYMENT_TARGET"
+
+      - name: Notify build started
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          set -euo pipefail
+          ./scripts/report_progress.sh \
+            "${{ github.event.inputs.issue_number }}" \
+            "${{ github.event.inputs.source_repo }}" \
+            "preparing" \
+            "deployment_target=${{ steps.parse-target.outputs.deployment_target }}"
+
       - name: Create product repository from template
         id: create
         env:
           GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
+          set -euo pipefail
           if gh repo view "$PRODUCT_REPO" &>/dev/null; then
             echo "Repository already exists"
-            echo "created=false" >> $GITHUB_OUTPUT
+            echo "created=false" >> "$GITHUB_OUTPUT"
           else
             gh repo create "$PRODUCT_REPO" \
               --template kaionn/mvp-template \
               --public \
               --clone=false
-            echo "created=true" >> $GITHUB_OUTPUT
+            echo "created=true" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Wait for template generation
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
-          # テンプレートからのリポジトリ生成は非同期のため、コンテンツが反映されるまで待機
+          set -euo pipefail
+          # テンプレートからのリポジトリ生成は非同期のためコンテンツが反映されるまで待機
           for i in $(seq 1 12); do
             FILE_COUNT=$(gh api "repos/$PRODUCT_REPO/contents/" --jq 'length' 2>/dev/null || echo "0")
             if [ "$FILE_COUNT" -gt 0 ]; then
               echo "✅ Template content ready ($FILE_COUNT files)"
-              break
+              exit 0
             fi
             echo "Waiting for template generation... (attempt $i/12)"
             sleep 5
           done
+          echo "::error::Template content not available after 60s"
+          exit 1
+
+      - name: Notify cloning
         env:
-          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          set -euo pipefail
+          ./scripts/report_progress.sh \
+            "${{ github.event.inputs.issue_number }}" \
+            "${{ github.event.inputs.source_repo }}" \
+            "cloning"
 
       - name: Clone product repository
         env:
           GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
+          set -euo pipefail
           gh repo clone "$PRODUCT_REPO" product-repo
 
-      - name: Place spec and deep dive files
+      - name: Place spec, deep dive and origin
         env:
           GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
+          set -euo pipefail
           cd product-repo
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ env.PRODUCT_REPO }}.git"
           mkdir -p docs
 
-          echo "${{ github.event.inputs.spec_content }}" | base64 -d > docs/spec.md
+          cp /tmp/build/spec.md docs/spec.md
 
           DEEP_DIVE="${{ github.event.inputs.deep_dive_content }}"
           if [ -n "$DEEP_DIVE" ]; then
@@ -183,11 +209,44 @@ jobs:
           - pain-collector Issue: ${{ github.event.inputs.source_repo }}#${{ github.event.inputs.issue_number }}
           - Generated by: kaionn/mvp-factory
           - Generated at: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          - Deployment target: ${{ steps.parse-target.outputs.deployment_target }}
           ORIGIN
 
+          # init.sh があれば走らせて placeholder を置換
+          if [ -x scripts/init.sh ]; then
+            PRODUCT_NAME="${{ github.event.inputs.product_name }}" \
+              bash scripts/init.sh
+          fi
+
           git add .
-          git commit -m "docs: Spec と Deep Dive を配置"
+          git commit -m "docs: Spec / Deep Dive / origin を配置"
           git push
+
+      - name: Configure main branch protection
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          set -euo pipefail
+          # main への直接 push を禁止し PR を必須化。reviewer 0 で self-approve 可、
+          # enforce_admins=false で緊急時は owner が bypass 可能。
+          gh api -X PUT "repos/$PRODUCT_REPO/branches/main/protection" \
+            --input - <<'JSON'
+          {
+            "required_status_checks": null,
+            "enforce_admins": false,
+            "required_pull_request_reviews": {
+              "dismiss_stale_reviews": false,
+              "require_code_owner_reviews": false,
+              "required_approving_review_count": 0
+            },
+            "restrictions": null,
+            "allow_force_pushes": false,
+            "allow_deletions": false,
+            "required_linear_history": false,
+            "required_conversation_resolution": false
+          }
+          JSON
+          echo "✅ main ブランチプロテクション設定完了: $PRODUCT_REPO"
 
       - name: Upload product-repo as artifact
         uses: actions/upload-artifact@v4
@@ -199,13 +258,27 @@ jobs:
     needs: create-repo
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    outputs:
+      pr_url: ${{ steps.push-pr.outputs.pr_url }}
+      build_status: ${{ steps.run-claude.outcome }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Notify building
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          set -euo pipefail
+          ./scripts/report_progress.sh \
+            "${{ github.event.inputs.issue_number }}" \
+            "${{ github.event.inputs.source_repo }}" \
+            "building"
 
       - name: Clone product repository
         env:
           GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
+          set -euo pipefail
           gh repo clone "$PRODUCT_REPO" product-repo
           cd product-repo
           git config user.name "github-actions[bot]"
@@ -216,27 +289,65 @@ jobs:
         run: npm install -g @anthropic-ai/claude-code
 
       - name: Run Claude Code with spec
+        id: run-claude
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          DEPLOYMENT_TARGET: ${{ needs.create-repo.outputs.deployment_target }}
         run: |
+          set -uo pipefail
           cd product-repo
 
           SPEC_PATH="docs/spec.md"
-          PROMPT=$(cat ${{ github.workspace }}/templates/claude-prompt.md | sed "s|{{SPEC_PATH}}|$SPEC_PATH|g")
+          # deployment_target に対応するデプロイコマンドをプロンプトに注入
+          DEPLOY_CMD=$(jq -r --arg t "$DEPLOYMENT_TARGET" \
+            '.targets[$t].command // ""' \
+            "${{ github.workspace }}/config/deploy-targets.json")
 
+          PROMPT=$(sed \
+            -e "s|{{SPEC_PATH}}|$SPEC_PATH|g" \
+            "${{ github.workspace }}/templates/claude-prompt.md")
+          PROMPT="$PROMPT
+
+          ## Deployment
+
+          このプロジェクトの deployment_target は \`$DEPLOYMENT_TARGET\` なのだ。
+          デプロイ用コマンドの目安: \`$DEPLOY_CMD\`
+          README にデプロイ手順を記載してほしいのだ。"
+
+          # 失敗を捕捉して後続ステップに伝播させる（|| true は使わない）
+          set +e
           claude -p "$PROMPT" \
             --dangerously-skip-permissions \
             --output-format text \
             --max-turns 100 \
-            > ../build.log 2>&1 || true
+            > ../build.log 2>&1
+          CLAUDE_EXIT=$?
+          set -e
 
           echo "--- Build Log (last 50 lines) ---"
-          tail -50 ../build.log
+          tail -50 ../build.log || true
+
+          if [ "$CLAUDE_EXIT" -ne 0 ]; then
+            echo "::warning::Claude Code exited with code $CLAUDE_EXIT (続行して PR 生成を試みる)"
+          fi
+          # log は upload artifact 用に残す
+          cp ../build.log ./build.log.copy 2>/dev/null || true
+
+      - name: Upload build log
+        # B-3: Claude Code 失敗時のデバッグ用に build.log を必ず保存する
+        # （後続の Report failure ステップが artifact 経由で参照するため）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
 
       - name: Push changes and create PR
+        id: push-pr
         env:
           GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
+          set -euo pipefail
           cd product-repo
 
           if [ -n "$(git status --porcelain)" ]; then
@@ -257,6 +368,7 @@ jobs:
           - Spec: docs/spec.md
           - Deep Dive: docs/deep-dive.md（存在する場合）
           - pain-collector: ${{ github.event.inputs.source_repo }}#${{ github.event.inputs.issue_number }}
+          - Deployment target: ${{ needs.create-repo.outputs.deployment_target }}
 
           ## 生成方法
           - Claude Code + compound-engineering plugin
@@ -269,43 +381,75 @@ jobs:
               --head "$BRANCH" \
               --base main)
 
-            echo "PR_URL=$PR_URL" >> $GITHUB_ENV
+            echo "pr_url=$PR_URL" >> "$GITHUB_OUTPUT"
           else
             echo "No changes generated"
-            echo "PR_URL=" >> $GITHUB_ENV
+            echo "pr_url=" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Report result to pain-collector
+      - name: Notify pushing
+        if: steps.push-pr.outputs.pr_url != ''
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          set -euo pipefail
+          ./scripts/report_progress.sh \
+            "${{ github.event.inputs.issue_number }}" \
+            "${{ github.event.inputs.source_repo }}" \
+            "pushing" \
+            "${{ steps.push-pr.outputs.pr_url }}"
+
+      - name: Report success to pain-collector
+        if: steps.push-pr.outputs.pr_url != ''
         env:
           GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
+          set -euo pipefail
           ISSUE="${{ github.event.inputs.issue_number }}"
           SOURCE="${{ github.event.inputs.source_repo }}"
           PRODUCT="${{ env.PRODUCT_REPO }}"
+          PR_URL="${{ steps.push-pr.outputs.pr_url }}"
 
-          if [ -n "$PR_URL" ]; then
-            COMMENT="## MVP 自動生成完了
+          gh issue comment "$ISSUE" --repo "$SOURCE" --body "## ✅ MVP 自動生成完了
 
           - リポジトリ: [$PRODUCT](https://github.com/$PRODUCT)
           - PR: $PR_URL
+          - Deployment target: ${{ needs.create-repo.outputs.deployment_target }}
           - ステータス: PR レビュー待ち
 
           次のステップ:
           1. PR をレビューしてマージ
-          2. デプロイ設定（Vercel 等）
+          2. デプロイ設定
           3. LP でウェイトリスト収集"
-          else
-            COMMENT="## MVP 自動生成で変更なし
+
+          gh issue edit "$ISSUE" --repo "$SOURCE" \
+            --remove-label "building" --add-label "pr-created"
+
+      - name: Report no-changes to pain-collector
+        if: steps.push-pr.outputs.pr_url == '' && steps.run-claude.outcome == 'success'
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh issue comment "${{ github.event.inputs.issue_number }}" \
+            --repo "${{ github.event.inputs.source_repo }}" \
+            --body "## ⚠️ MVP 自動生成で変更なし
 
           Claude Code の実行は完了しましたが、コード変更が生成されませんでした。
-          ビルドログを確認してください。
+          ワークフローの build-log artifact を確認してほしいのだ。
 
-          リポジトリ: [$PRODUCT](https://github.com/$PRODUCT)"
-          fi
+          リポジトリ: [${{ env.PRODUCT_REPO }}](https://github.com/${{ env.PRODUCT_REPO }})"
 
-          gh issue comment "$ISSUE" --repo "$SOURCE" --body "$COMMENT"
-
-          if [ -n "$PR_URL" ]; then
-            gh issue edit "$ISSUE" --repo "$SOURCE" \
-              --remove-label "building" --add-label "pr-created" 2>/dev/null || true
-          fi
+      - name: Report failure to pain-collector
+        if: failure()
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          set -euo pipefail
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          ./scripts/report_failure.sh \
+            "${{ github.event.inputs.issue_number }}" \
+            "${{ github.event.inputs.source_repo }}" \
+            "${{ env.PRODUCT_REPO }}" \
+            "build.log" \
+            "$RUN_URL"
