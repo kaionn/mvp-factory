@@ -45,6 +45,85 @@ jobs:
             exit 1
           fi
 
+      - name: Validate spec against schema
+        id: validate-spec
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          SOURCE="${{ github.event.inputs.source_repo }}"
+          SPEC_B64="${{ github.event.inputs.spec_content }}"
+
+          echo "$SPEC_B64" | base64 -d > /tmp/spec.md
+
+          # pain-collector から JSON Schema を取得（main branch から）
+          SCHEMA_URL="https://raw.githubusercontent.com/${SOURCE}/main/specs/schema.json"
+          if ! curl -fsSL "$SCHEMA_URL" -o /tmp/schema.json; then
+            echo "::warning::Schema を取得できませんでした ($SCHEMA_URL)。検証をスキップして続行します。"
+            exit 0
+          fi
+
+          pip install --quiet pyyaml jsonschema
+
+          python3 <<'PY'
+          import json
+          import re
+          import sys
+
+          import yaml
+          from jsonschema import Draft7Validator
+
+          with open('/tmp/spec.md', encoding='utf-8') as f:
+              content = f.read()
+
+          fm_match = re.match(r'^---\s*\n(.*?)\n---\s*\n', content, re.DOTALL)
+          if not fm_match:
+              print('::warning::Front Matter が存在しない legacy Spec です。検証をスキップします。')
+              sys.exit(0)
+
+          try:
+              front_matter = yaml.safe_load(fm_match.group(1))
+          except yaml.YAMLError as exc:
+              print(f'::error::Front Matter の YAML パースに失敗: {exc}')
+              sys.exit(1)
+
+          if not isinstance(front_matter, dict):
+              print('::error::Front Matter がオブジェクト形式ではありません')
+              sys.exit(1)
+
+          with open('/tmp/schema.json', encoding='utf-8') as f:
+              schema = json.load(f)
+
+          validator = Draft7Validator(schema)
+          errors = sorted(validator.iter_errors(front_matter), key=lambda e: list(e.absolute_path))
+
+          if errors:
+              for err in errors:
+                  path = '.'.join(str(p) for p in err.absolute_path) or '<root>'
+                  print(f'::error::Spec validation failure at {path}: {err.message}')
+              sys.exit(1)
+
+          print('✅ Spec validation passed')
+          PY
+
+      - name: Notify spec validation failure
+        if: failure() && steps.validate-spec.conclusion == 'failure'
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          ISSUE="${{ github.event.inputs.issue_number }}"
+          SOURCE="${{ github.event.inputs.source_repo }}"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          gh issue edit "$ISSUE" --repo "$SOURCE" --add-label "spec-invalid" 2>/dev/null || true
+          gh issue comment "$ISSUE" --repo "$SOURCE" --body "❌ Spec が schema 検証に失敗したため build を中止したのだ。
+
+          - Schema 仕様: https://github.com/$SOURCE/blob/main/specs/SCHEMA.md
+          - 失敗ログ: $RUN_URL
+
+          \`/spec --force\` で Spec を再生成してから \`/approve\` を再実行してほしいのだ。"
+
       - name: Create product repository from template
         id: create
         env:
